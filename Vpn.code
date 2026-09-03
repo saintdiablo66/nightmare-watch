@@ -1,1 +1,452 @@
+import socket
+import threading
+import ssl
+import hashlib
+import hmac
+import os
+from cryptography.fernet import Fernet
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2
+from cryptography.hazmat.backends import default_backend
+import base64
+import json
+import time
+from datetime import datetime, timedelta
+import logging
 
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('vpn.log'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
+
+
+class VPNConfig:
+    """VPN Configuration Handler"""
+    def __init__(self):
+        self.protocol_version = "2.0"
+        self.encryption_algorithm = "AES-256"
+        self.hash_algorithm = "SHA-256"
+        self.max_connections = 1000
+        self.connection_timeout = 300
+        self.key_rotation_interval = 3600
+        self.buffer_size = 4096
+        self.handshake_timeout = 30
+
+
+class EncryptionManager:
+    """Handles all encryption/decryption operations"""
+    def __init__(self, password: str, salt: bytes = None):
+        if salt is None:
+            salt = os.urandom(16)
+        self.salt = salt
+        
+        # Derive key using PBKDF2
+        kdf = PBKDF2(
+            algorithm=hashes.SHA256(),
+            length=32,
+            salt=salt,
+            iterations=100000,
+            backend=default_backend()
+        )
+        key = base64.urlsafe_b64encode(kdf.derive(password.encode()))
+        self.cipher_suite = Fernet(key)
+        
+    def encrypt(self, data: bytes) -> bytes:
+        """Encrypt data"""
+        try:
+            return self.cipher_suite.encrypt(data)
+        except Exception as e:
+            logger.error(f"Encryption failed: {e}")
+            raise
+    
+    def decrypt(self, encrypted_data: bytes) -> bytes:
+        """Decrypt data"""
+        try:
+            return self.cipher_suite.decrypt(encrypted_data)
+        except Exception as e:
+            logger.error(f"Decryption failed: {e}")
+            raise
+
+
+class AuthenticationManager:
+    """Handles user authentication and authorization"""
+    def __init__(self):
+        self.users = {}
+        self.active_sessions = {}
+        self.failed_attempts = {}
+        self.lockout_duration = 300  # 5 minutes
+        self.max_attempts = 5
+    
+    def register_user(self, username: str, password: str) -> bool:
+        """Register new user"""
+        if username in self.users:
+            logger.warning(f"User {username} already exists")
+            return False
+        
+        # Hash password with salt
+        salt = os.urandom(16)
+        hash_obj = hashlib.pbkdf2_hmac('sha256', password.encode(), salt, 100000)
+        self.users[username] = {
+            'password_hash': hash_obj.hex(),
+            'salt': salt.hex(),
+            'created_at': datetime.now().isoformat(),
+            'last_login': None
+        }
+        logger.info(f"User {username} registered successfully")
+        return True
+    
+    def authenticate(self, username: str, password: str) -> tuple[bool, str]:
+        """Authenticate user"""
+        # Check lockout status
+        if username in self.failed_attempts:
+            attempts, lockout_time = self.failed_attempts[username]
+            if datetime.now() < lockout_time:
+                return False, "Account temporarily locked due to failed attempts"
+        
+        if username not in self.users:
+            return False, "User not found"
+        
+        user = self.users[username]
+        salt = bytes.fromhex(user['salt'])
+        hash_obj = hashlib.pbkdf2_hmac('sha256', password.encode(), salt, 100000)
+        
+        if hash_obj.hex() == user['password_hash']:
+            session_id = self._generate_session_id()
+            self.active_sessions[session_id] = {
+                'username': username,
+                'created_at': datetime.now(),
+                'last_activity': datetime.now()
+            }
+            user['last_login'] = datetime.now().isoformat()
+            
+            # Clear failed attempts
+            if username in self.failed_attempts:
+                del self.failed_attempts[username]
+            
+            logger.info(f"User {username} authenticated successfully")
+            return True, session_id
+        else:
+            # Track failed attempt
+            if username not in self.failed_attempts:
+                self.failed_attempts[username] = (1, datetime.now() + timedelta(seconds=self.lockout_duration))
+            else:
+                attempts, _ = self.failed_attempts[username]
+                if attempts >= self.max_attempts:
+                    self.failed_attempts[username] = (attempts + 1, datetime.now() + timedelta(seconds=self.lockout_duration))
+                else:
+                    self.failed_attempts[username] = (attempts + 1, datetime.now() + timedelta(seconds=self.lockout_duration))
+            
+            return False, "Invalid credentials"
+    
+    def validate_session(self, session_id: str) -> bool:
+        """Validate session"""
+        if session_id not in self.active_sessions:
+            return False
+        
+        session = self.active_sessions[session_id]
+        if datetime.now() - session['last_activity'] > timedelta(seconds=3600):
+            del self.active_sessions[session_id]
+            return False
+        
+        session['last_activity'] = datetime.now()
+        return True
+    
+    def _generate_session_id(self) -> str:
+        """Generate unique session ID"""
+        return hashlib.sha256(os.urandom(32)).hexdigest()
+
+
+class VPNServer:
+    """Main VPN Server Implementation"""
+    def __init__(self, host: str = '0.0.0.0', port: int = 8443, password: str = 'vpn_master_key'):
+        self.host = host
+        self.port = port
+        self.config = VPNConfig()
+        self.encryption_manager = EncryptionManager(password)
+        self.auth_manager = AuthenticationManager()
+        self.active_connections = {}
+        self.connection_lock = threading.Lock()
+        self.running = False
+        logger.info(f"VPN Server initialized on {host}:{port}")
+    
+    def start(self):
+        """Start VPN server"""
+        self.running = True
+        server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        server_socket.bind((self.host, self.port))
+        server_socket.listen(self.config.max_connections)
+        
+        logger.info(f"VPN Server started on {self.host}:{self.port}")
+        
+        try:
+            while self.running:
+                try:
+                    client_socket, addr = server_socket.accept()
+                    logger.info(f"New connection from {addr}")
+                    client_thread = threading.Thread(
+                        target=self._handle_client,
+                        args=(client_socket, addr)
+                    )
+                    client_thread.daemon = True
+                    client_thread.start()
+                except socket.timeout:
+                    continue
+                except Exception as e:
+                    logger.error(f"Accept error: {e}")
+        except KeyboardInterrupt:
+            logger.info("Server shutdown requested")
+        finally:
+            server_socket.close()
+            self.running = False
+    
+    def _handle_client(self, client_socket: socket.socket, addr: tuple):
+        """Handle individual client connection"""
+        client_id = f"{addr[0]}:{addr[1]}"
+        try:
+            # Handshake
+            if not self._perform_handshake(client_socket, client_id):
+                client_socket.close()
+                return
+            
+            # Main communication loop
+            while self.running:
+                try:
+                    data = client_socket.recv(self.config.buffer_size)
+                    if not data:
+                        break
+                    
+                    # Decrypt message
+                    decrypted_data = self.encryption_manager.decrypt(data)
+                    response = self._process_request(decrypted_data, client_id)
+                    
+                    # Encrypt and send response
+                    encrypted_response = self.encryption_manager.encrypt(response)
+                    client_socket.sendall(encrypted_response)
+                    
+                except socket.timeout:
+                    continue
+                except Exception as e:
+                    logger.error(f"Client {client_id} error: {e}")
+                    break
+        except Exception as e:
+            logger.error(f"Connection handler error for {client_id}: {e}")
+        finally:
+            with self.connection_lock:
+                if client_id in self.active_connections:
+                    del self.active_connections[client_id]
+            client_socket.close()
+            logger.info(f"Connection closed: {client_id}")
+    
+    def _perform_handshake(self, client_socket: socket.socket, client_id: str) -> bool:
+        """Perform TLS-like handshake"""
+        try:
+            # Receive client hello
+            hello_data = client_socket.recv(1024)
+            hello_msg = json.loads(hello_data.decode())
+            
+            # Verify protocol version
+            if hello_msg.get('version') != self.config.protocol_version:
+                logger.warning(f"Protocol mismatch from {client_id}")
+                return False
+            
+            # Send server hello
+            server_hello = {
+                'version': self.config.protocol_version,
+                'encryption': self.config.encryption_algorithm,
+                'hash': self.config.hash_algorithm,
+                'timestamp': datetime.now().isoformat()
+            }
+            client_socket.sendall(json.dumps(server_hello).encode())
+            
+            # Receive credentials
+            credentials_data = client_socket.recv(1024)
+            credentials = json.loads(credentials_data.decode())
+            
+            # Authenticate
+            auth_success, result = self.auth_manager.authenticate(
+                credentials.get('username'),
+                credentials.get('password')
+            )
+            
+            if not auth_success:
+                error_response = {'success': False, 'message': result}
+                client_socket.sendall(json.dumps(error_response).encode())
+                return False
+            
+            # Send auth success
+            auth_response = {
+                'success': True,
+                'session_id': result,
+                'timestamp': datetime.now().isoformat()
+            }
+            client_socket.sendall(json.dumps(auth_response).encode())
+            
+            with self.connection_lock:
+                self.active_connections[client_id] = {
+                    'session_id': result,
+                    'connected_at': datetime.now(),
+                    'username': credentials.get('username')
+                }
+            
+            logger.info(f"Handshake successful for {client_id}")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Handshake error for {client_id}: {e}")
+            return False
+    
+    def _process_request(self, data: bytes, client_id: str) -> bytes:
+        """Process client request"""
+        try:
+            request = json.loads(data.decode())
+            action = request.get('action')
+            
+            if action == 'ping':
+                response = {'type': 'pong', 'timestamp': datetime.now().isoformat()}
+            elif action == 'get_ip':
+                response = {'type': 'ip_info', 'client_id': client_id}
+            elif action == 'tunnel':
+                response = {'type': 'tunnel_established', 'bandwidth': 'unlimited'}
+            else:
+                response = {'type': 'error', 'message': 'Unknown action'}
+            
+            return json.dumps(response).encode()
+        except Exception as e:
+            logger.error(f"Request processing error: {e}")
+            return json.dumps({'type': 'error', 'message': str(e)}).encode()
+    
+    def get_active_connections(self) -> dict:
+        """Get active connections info"""
+        with self.connection_lock:
+            return self.active_connections.copy()
+    
+    def disconnect_client(self, client_id: str) -> bool:
+        """Disconnect specific client"""
+        with self.connection_lock:
+            if client_id in self.active_connections:
+                del self.active_connections[client_id]
+                logger.info(f"Force disconnected: {client_id}")
+                return True
+        return False
+
+
+class VPNClient:
+    """VPN Client Implementation"""
+    def __init__(self, server_host: str, server_port: int, username: str, password: str):
+        self.server_host = server_host
+        self.server_port = server_port
+        self.username = username
+        self.password = password
+        self.encryption_manager = EncryptionManager(password)
+        self.socket = None
+        self.connected = False
+        logger.info(f"VPN Client initialized for {username}")
+    
+    def connect(self) -> bool:
+        """Connect to VPN server"""
+        try:
+            self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.socket.connect((self.server_host, self.server_port))
+            
+            # Send client hello
+            hello = {
+                'version': '2.0',
+                'timestamp': datetime.now().isoformat()
+            }
+            self.socket.sendall(json.dumps(hello).encode())
+            
+            # Receive server hello
+            server_hello_data = self.socket.recv(1024)
+            server_hello = json.loads(server_hello_data.decode())
+            logger.info(f"Server hello received: {server_hello}")
+            
+            # Send credentials
+            credentials = {
+                'username': self.username,
+                'password': self.password
+            }
+            self.socket.sendall(json.dumps(credentials).encode())
+            
+            # Receive auth response
+            auth_response_data = self.socket.recv(1024)
+            auth_response = json.loads(auth_response_data.decode())
+            
+            if auth_response.get('success'):
+                self.connected = True
+                logger.info(f"Connected to VPN: {auth_response}")
+                return True
+            else:
+                logger.error(f"Authentication failed: {auth_response.get('message')}")
+                return False
+                
+        except Exception as e:
+            logger.error(f"Connection failed: {e}")
+            return False
+    
+    def send_request(self, action: str, data: dict = None) -> dict:
+        """Send request to VPN server"""
+        if not self.connected:
+            logger.error("Not connected to VPN")
+            return {'error': 'Not connected'}
+        
+        try:
+            request = {'action': action, **(data or {})}
+            encrypted_request = self.encryption_manager.encrypt(json.dumps(request).encode())
+            self.socket.sendall(encrypted_request)
+            
+            # Receive response
+            encrypted_response = self.socket.recv(4096)
+            decrypted_response = self.encryption_manager.decrypt(encrypted_response)
+            response = json.loads(decrypted_response.decode())
+            
+            return response
+        except Exception as e:
+            logger.error(f"Request error: {e}")
+            return {'error': str(e)}
+    
+    def disconnect(self):
+        """Disconnect from VPN"""
+        if self.socket:
+            self.socket.close()
+            self.connected = False
+            logger.info("Disconnected from VPN")
+
+
+# Example usage
+if __name__ == "__main__":
+    # Start server
+    vpn_server = VPNServer(host='0.0.0.0', port=8443, password='secure_vpn_key_2024')
+    
+    # Register test users
+    vpn_server.auth_manager.register_user('admin', 'admin_password')
+    vpn_server.auth_manager.register_user('user1', 'user1_password')
+    
+    # Start server in thread
+    server_thread = threading.Thread(target=vpn_server.start)
+    server_thread.daemon = True
+    server_thread.start()
+    
+    # Give server time to start
+    time.sleep(1)
+    
+    # Test client connection
+    client = VPNClient('localhost', 8443, 'admin', 'admin_password')
+    if client.connect():
+        # Send test requests
+        print(client.send_request('ping'))
+        print(client.send_request('get_ip'))
+        client.disconnect()
+    
+    # Keep server running
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        vpn_server.running = False
